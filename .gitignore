@@ -1,5 +1,6 @@
 dist/
 __pycache__/
 *.py[cod]
+*.egg-info/
 *.zip
 SHA256SUMS
