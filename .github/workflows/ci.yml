@@ -1,0 +1,36 @@
+name: Build ROM suite
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Generate ROMs
+        run: python generate.py --output dist
+
+      - name: Verify reproducibility
+        run: python generate.py --output dist --check
+
+      - name: Upload ROM suite
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pygameboy-test-rom
+          path: dist
+          if-no-files-found: error

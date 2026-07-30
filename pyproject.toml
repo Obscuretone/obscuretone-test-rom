@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygameboy-test-rom"
+version = "0.1.0"
+description = "Self-checking DMG opcode and subsystem diagnostic ROM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Evan D'Entremont" }]
+
+[project.urls]
+Repository = "https://github.com/Obscuretone/pygameboy-test-rom"
+Issues = "https://github.com/Obscuretone/pygameboy-test-rom/issues"
+
+[project.scripts]
+pygameboy-test-rom = "generate:main"
+
+[tool.setuptools]
+py-modules = ["generate"]
