@@ -1,4 +1,4 @@
-"""Build PyGameBoy's first-party, self-checking DMG diagnostic ROMs.
+"""Build Obscuretone Test ROM's self-checking DMG diagnostics.
 
 The generator deliberately has no assembler dependency.  Its small emitter makes
 the generated binaries reproducible on every Python version supported by the
@@ -6,9 +6,9 @@ project and, more importantly, keeps an exact ledger of the opcodes emitted as
 instructions.  Generation fails if the core ROM does not exercise every legal
 base opcode (STOP has a dedicated probe ROM) and all 256 CB-prefixed opcodes.
 
-The ROMs use their own versioned ``PYGB/1`` serial event stream and mailbox:
+The ROMs use their own versioned ``OTR/1`` serial event stream and mailbox:
 
-    A000-A003  ASCII "PYGB"
+    A000-A003  ASCII "OTR1"
     A004       7E while running, 00 on success, E0 on failure
     A005       current/failing group
     A006       current/failing case or opcode
@@ -22,9 +22,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Iterable
+from typing import Final
 
 ROM_SIZE: Final = 32 * 1024
 CODE_START: Final = 0x0150
@@ -526,9 +527,9 @@ def add_load_matrix_tests(rom: Rom) -> None:
                 elif source == "l":
                     expected = WRAM_VALUE & 0xFF
                 else:
-                    rom.ld_a(value)
-                    rom.ins(0x77)
-                    expected = value
+                    # LD (HL),(HL) is opcode 0x76 (HALT) and was skipped above,
+                    # so L is the only remaining source.
+                    expected = WRAM_VALUE & 0xFF
             else:
                 expected = setup_ld_state(rom, source, value)
 
@@ -1249,7 +1250,7 @@ def add_display_and_serial_routines(rom: Rom) -> None:
 
 def add_rom_data(rom: Rom) -> None:
     rom.label("ProtocolPrefix")
-    rom.raw(*b"PYGB/1 ", 0)
+    rom.raw(*b"OTR/1 ", 0)
     for label, message in rom.progress_messages:
         rom.label(label)
         rom.raw(*message, 0)
@@ -1324,7 +1325,7 @@ def controller_rom(
 
 def build_mbc1_rom() -> bytes:
     rom = controller_rom(
-        "PYGB-MBC1",
+        "OTR-MBC1",
         cartridge_type=0x03,
         size=64 * 1024,
         rom_size_code=0x01,
@@ -1358,7 +1359,7 @@ def build_mbc1_rom() -> bytes:
 
 def build_mbc2_rom() -> bytes:
     rom = controller_rom(
-        "PYGB-MBC2",
+        "OTR-MBC2",
         cartridge_type=0x06,
         size=64 * 1024,
         rom_size_code=0x01,
@@ -1386,7 +1387,7 @@ def build_mbc2_rom() -> bytes:
 
 def build_mbc3_rom() -> bytes:
     rom = controller_rom(
-        "PYGB-MBC3",
+        "OTR-MBC3",
         cartridge_type=0x10,
         size=64 * 1024,
         rom_size_code=0x01,
@@ -1424,7 +1425,7 @@ def build_mbc3_rom() -> bytes:
 
 def build_mbc5_rom() -> bytes:
     rom = controller_rom(
-        "PYGB-MBC5",
+        "OTR-MBC5",
         cartridge_type=0x1B,
         size=8 * 1024 * 1024,
         rom_size_code=0x08,
@@ -1467,16 +1468,16 @@ def build_controller_roms() -> dict[str, bytes]:
 
 
 def build_core_rom() -> tuple[bytes, dict]:
-    rom = Rom("PYGB-CONFORM")
+    rom = Rom("OTR-DIAGNOSTIC")
     add_vectors(rom)
     rom.label("Main")
     rom.ins(0xF3)
     rom.ld_rr(0x31, 0xDFF0)
     rom.call("InitDisplay")
-    rom.write_value(0xA000, ord("P"))
-    rom.write_value(0xA001, ord("Y"))
-    rom.write_value(0xA002, ord("G"))
-    rom.write_value(0xA003, ord("B"))
+    rom.write_value(0xA000, ord("O"))
+    rom.write_value(0xA001, ord("T"))
+    rom.write_value(0xA002, ord("R"))
+    rom.write_value(0xA003, ord("1"))
     rom.write_value(0xA004, 0x7E)
     rom.write_value(0xA005, 0)
     rom.write_value(0xA006, 0)
@@ -1507,11 +1508,11 @@ def build_core_rom() -> tuple[bytes, dict]:
     image = rom.finish()
     manifest = {
         "schema_version": 1,
-        "rom": "pygameboy-test-rom.gb",
+        "rom": "otr.gb",
         "sha256": hashlib.sha256(image).hexdigest(),
         "size": len(image),
         "code_end": rom.pc,
-        "protocol": "PYGB/1",
+        "protocol": "OTR/1",
         "base_opcodes": [f"{value:02X}" for value in sorted(LEGAL_BASE_OPCODES)],
         "core_base_opcodes": [
             f"{value:02X}" for value in sorted(rom.base_coverage)
@@ -1543,7 +1544,7 @@ def build_core_rom() -> tuple[bytes, dict]:
 
 
 def build_probe_rom(opcode: int) -> bytes:
-    rom = Rom(f"PYGB-PROBE-{opcode:02X}", cartridge_type=0x00)
+    rom = Rom(f"OTR-PROBE-{opcode:02X}", cartridge_type=0x00)
     rom.label("Main")
     rom.ins(opcode, 0, cover=False)
     loop = rom.unique("probe")
@@ -1579,7 +1580,7 @@ def bundle() -> tuple[bytes, dict, dict[str, bytes], dict[str, bytes]]:
 def write_outputs(output: Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     image, manifest, controllers, probes = bundle()
-    (output / "pygameboy-test-rom.gb").write_bytes(image)
+    (output / "otr.gb").write_bytes(image)
     (output / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
@@ -1609,7 +1610,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if args.check:
         expected_image, expected_manifest, controllers, probes = bundle()
-        image_path = args.output / "pygameboy-test-rom.gb"
+        image_path = args.output / "otr.gb"
         manifest_path = args.output / "manifest.json"
         if not image_path.is_file() or not manifest_path.is_file():
             print("generated first-party ROM artifacts are missing")

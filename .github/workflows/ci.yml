@@ -1,8 +1,9 @@
-name: Build ROM suite
+name: Build OTR .gb ROMs
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,16 +22,27 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Generate ROMs
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Test generator
+        run: pytest
+
+      - name: Build .gb ROMs
         run: python generate.py --output dist
 
       - name: Verify reproducibility
         run: python generate.py --output dist --check
 
-      - name: Upload ROM suite
+      - name: Upload .gb ROMs
         if: matrix.python-version == '3.13'
         uses: actions/upload-artifact@v7
         with:
-          name: pygameboy-test-rom
-          path: dist
+          name: otr-gb-roms
+          path: |
+            dist/otr.gb
+            dist/controllers/*.gb
+            dist/probes/*.gb
+            dist/manifest.json
           if-no-files-found: error
+          retention-days: 30

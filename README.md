@@ -1,12 +1,14 @@
-# PyGameBoy Test ROM
+# Obscuretone Test ROM (OTR)
 
-PyGameBoy Test ROM is a first-party, self-checking diagnostic for the DMG Game
-Boy. It is built from a dependency-free Python generator, shows its current test
+Read the launch story: [Introducing Obscuretone Test ROM](BLOG.md).
+
+Obscuretone Test ROM is a self-checking diagnostic for the DMG Game Boy. It is
+built from a dependency-free Python generator, shows its current test
 on the emulated display, streams structured progress over the serial port, and
 halts at the first failure.
 
 This is its own test system, not a wrapper around Blargg, Mooneye, or another
-compatibility suite. Its public reporting contract is the versioned `PYGB/1`
+compatibility suite. Its public reporting contract is the versioned `OTR/1`
 protocol.
 
 ## What it tests
@@ -32,7 +34,7 @@ included. The generator uses independent flag/result oracles and deliberately
 chosen boundary vectors.
 
 Some hardware behavior cannot be observed by software running inside a
-cartridge. The PyGameBoy host harness therefore also verifies the rendered
+cartridge. Emulator host harnesses can additionally verify the rendered
 framebuffer, produced audio buffer, STOP state, undefined-opcode behavior, and
 the exact set of dispatched opcodes.
 
@@ -48,6 +50,12 @@ python generate.py --output dist --check
 The output contains the core ROM, controller ROMs, opcode probes, and
 `manifest.json`. The large MBC5 image is mostly zero-filled and compresses well
 in release archives.
+
+GitHub Actions builds the same files on every push and pull request. The
+**Build OTR .gb ROMs** workflow can also be run manually from the Actions tab;
+its **otr-gb-roms** artifact contains `otr.gb`, all controller and opcode-probe
+ROMs, and `manifest.json`. Version tags build and verify the ROMs again before
+the release archive is published.
 
 Generated images intentionally leave the Nintendo logo area blank. They run in
 emulators that skip the original boot ROM, including PyGameBoy. A physical DMG
@@ -67,29 +75,29 @@ Success displays `PASS`. A failure displays `ERROR`, reports the exact
 disables interrupts, and executes HALT. Tests never continue after a failed
 assertion.
 
-## `PYGB/1` protocol
+## `OTR/1` protocol
 
 Serial output is line-oriented ASCII:
 
 ```text
-PYGB/1 01 CPU LOAD MATRIX
-PYGB/1 20 CB OPCODES
-PYGB/1 PASS
+OTR/1 01 CPU LOAD MATRIX
+OTR/1 20 CB OPCODES
+OTR/1 PASS
 ```
 
 On failure:
 
 ```text
-PYGB/1 ERROR
+OTR/1 ERROR
 AT 20:7C
-PYGB/1 FAIL
+OTR/1 FAIL
 ```
 
 The core ROM also exposes a memory mailbox in cartridge RAM:
 
 | Address | Meaning |
 |---|---|
-| `$A000-$A003` | ASCII `PYGB` |
+| `$A000-$A003` | ASCII `OTR1` |
 | `$A004` | `$7E` running, `$00` pass, `$E0` fail |
 | `$A005` | Current or failing group |
 | `$A006` | Current or failing case/opcode |

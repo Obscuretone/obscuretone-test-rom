@@ -1,4 +1,4 @@
-name: Release ROM suite
+name: Release OTR .gb ROMs
 
 on:
   push:
@@ -18,18 +18,28 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Build release
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Test generator
+        run: pytest
+
+      - name: Build and verify .gb ROMs
         run: |
           python generate.py --output dist
+          python generate.py --output dist --check
+
+      - name: Package release
+        run: |
           find dist -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          zip -9 -r "pygameboy-test-rom-${GITHUB_REF_NAME}.zip" \
-            dist README.md LICENSE SHA256SUMS
+          zip -9 -r "obscuretone-test-rom-${GITHUB_REF_NAME}.zip" \
+            dist README.md BLOG.md LICENSE SHA256SUMS
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "$GITHUB_REF_NAME"
-          "pygameboy-test-rom-${GITHUB_REF_NAME}.zip"
+          "obscuretone-test-rom-${GITHUB_REF_NAME}.zip"
           SHA256SUMS
           --generate-notes
