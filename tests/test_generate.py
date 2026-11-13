@@ -86,10 +86,17 @@ def test_generator_cli_writes_and_rejects_stale_artifacts(
     assert generator.main((*arguments, "--check")) == 0
 
     image = output / "otr.gb"
+    cgb_image = output / "otr-cgb.gb"
     manifest = output / "manifest.json"
     image.write_bytes(b"stale")
     assert generator.main((*arguments, "--check")) == 1
     assert "is stale" in capsys.readouterr().out
+
+    assert generator.main(arguments) == 0
+    capsys.readouterr()
+    cgb_image.write_bytes(b"stale")
+    assert generator.main((*arguments, "--check")) == 1
+    assert "otr-cgb.gb" in capsys.readouterr().out
 
     assert generator.main(arguments) == 0
     capsys.readouterr()
@@ -128,10 +135,12 @@ def test_generator_module_entrypoint(tmp_path: Path) -> None:
 
     assert exit_info.value.code == 0
     assert (output / "otr.gb").is_file()
+    assert (output / "otr-cgb.gb").is_file()
 
 
 def test_manifest_accounts_for_every_opcode_and_subsystem() -> None:
-    _, manifest = build_core_rom()
+    dmg_image, manifest = build_core_rom()
+    cgb_image, cgb_manifest = build_core_rom(cgb=True)
 
     assert manifest["protocol"] == "OTR/1"
     assert set(manifest["base_opcodes"]) == {
@@ -142,6 +151,15 @@ def test_manifest_accounts_for_every_opcode_and_subsystem() -> None:
     }
     assert "ppu registers" in manifest["subsystems"]
     assert "apu registers" in manifest["subsystems"]
+    assert dmg_image[0x147] == 0x1A
+    assert set(cgb_manifest["core_base_opcodes"]) == {
+        f"{opcode:02X}" for opcode in LEGAL_BASE_OPCODES
+    }
+    assert cgb_image[0x143] == 0xC0
+    assert cgb_image[0x147] == 0x1A
+    assert "cgb double-speed mode" in cgb_manifest["subsystems"]
+    assert "cgb hblank vram dma" in cgb_manifest["subsystems"]
+    assert "cgb pcm outputs" in cgb_manifest["subsystems"]
 
 
 def test_written_manifest_is_valid_json(tmp_path: Path) -> None:
@@ -149,6 +167,8 @@ def test_written_manifest_is_valid_json(tmp_path: Path) -> None:
     generator.write_outputs(output)
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["targets"] == ["dmg", "cgb"]
+    assert manifest["cgb_rom"]["rom"] == "otr-cgb.gb"
     assert set(manifest["controller_roms"]) == {
         "mbc1.gb",
         "mbc2.gb",

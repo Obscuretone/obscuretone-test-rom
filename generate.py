@@ -1,4 +1,4 @@
-"""Build Obscuretone Test ROM's self-checking DMG diagnostics.
+"""Build Obscuretone Test ROM's self-checking DMG and CGB diagnostics.
 
 The generator deliberately has no assembler dependency.  Its small emitter makes
 the generated binaries reproducible on every Python version supported by the
@@ -22,10 +22,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, TypedDict
 
 ROM_SIZE: Final = 32 * 1024
 CODE_START: Final = 0x0150
@@ -33,6 +33,7 @@ WRAM_VALUE: Final = 0xC100
 WRAM_ACTUAL: Final = 0xC200
 FAIL_GROUP: Final = 0xFF80
 FAIL_CASE: Final = 0xFF81
+OAM_DMA_ROUTINE: Final = 0xFF90
 
 ILLEGAL_BASE_OPCODES: Final = frozenset(
     {
@@ -122,6 +123,48 @@ class Fixup:
     relative: bool
 
 
+class ArtifactMetadata(TypedDict):
+    """Hash and size recorded for one generated artifact."""
+
+    size: int
+    sha256: str
+
+
+class CgbRomMetadata(ArtifactMetadata):
+    """Manifest contract for the CGB-mode diagnostic ROM."""
+
+    rom: str
+    code_end: int
+    base_opcodes: list[str]
+    cb_opcodes: list[str]
+    subsystems: list[str]
+
+
+class CoreManifest(TypedDict):
+    """Manifest fields produced while building the core diagnostic."""
+
+    schema_version: int
+    rom: str
+    sha256: str
+    size: int
+    code_end: int
+    protocol: str
+    base_opcodes: list[str]
+    core_base_opcodes: list[str]
+    cb_opcodes: list[str]
+    dedicated_probes: dict[str, str]
+    subsystems: list[str]
+
+
+class BundleManifest(CoreManifest):
+    """Complete manifest for the core, controller, and probe ROMs."""
+
+    targets: list[str]
+    cgb_rom: CgbRomMetadata
+    controller_roms: dict[str, ArtifactMetadata]
+    probe_roms: dict[str, str]
+
+
 class Rom:
     """A minimal label-aware LR35902 byte emitter with coverage accounting."""
 
@@ -133,12 +176,14 @@ class Rom:
         size: int = ROM_SIZE,
         rom_size_code: int = 0x00,
         ram_size_code: int = 0x02,
+        cgb_flag: int = 0x00,
     ) -> None:
         self.title = title
         self.cartridge_type = cartridge_type
         self.size = size
         self.rom_size_code = rom_size_code
         self.ram_size_code = ram_size_code
+        self.cgb_flag = cgb_flag
         self.image = bytearray(size)
         self.pc = CODE_START
         self.labels: dict[str, int] = {}
@@ -288,7 +333,7 @@ class Rom:
         self.base_coverage.add(0xC3)
         title = self.title.encode("ascii")[:15]
         self.image[0x134:0x143] = title.ljust(15, b"\0")
-        self.image[0x143] = 0x00
+        self.image[0x143] = self.cgb_flag
         self.image[0x146] = 0x00
         self.image[0x147] = self.cartridge_type
         self.image[0x148] = self.rom_size_code
@@ -338,11 +383,7 @@ def alu_result(operation: str, a: int, value: int, carry: int) -> tuple[int, int
         total = a - value - carry_in
         result = total & 0xFF
         flags = 0x40 | (0x80 if result == 0 else 0)
-        flags |= (
-            0x20
-            if (a & 0xF) < ((value & 0xF) + carry_in)
-            else 0
-        )
+        flags |= 0x20 if (a & 0xF) < ((value & 0xF) + carry_in) else 0
         flags |= 0x10 if total < 0 else 0
         return (a if operation == "cp" else result), flags
     if operation == "and":
@@ -454,7 +495,7 @@ def add_alu_tests(rom: Rom) -> None:
     starts = (0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8)
     rom.set_case(0x10, 0)
     rom.announce("10 CPU ALU")
-    for operation, start in zip(operations, starts):
+    for operation, start in zip(operations, starts, strict=True):
         for index, target in enumerate(REGISTER_CODES):
             opcode = start + index
             a = 0x81 if target == "a" else (0x0F + index * 0x11) & 0xFF
@@ -524,11 +565,9 @@ def add_load_matrix_tests(rom: Rom) -> None:
                     expected = value
                 elif source == "h":
                     expected = WRAM_VALUE >> 8
-                elif source == "l":
-                    expected = WRAM_VALUE & 0xFF
                 else:
-                    # LD (HL),(HL) is opcode 0x76 (HALT) and was skipped above,
-                    # so L is the only remaining source.
+                    # Source L is the only remaining case. LD (HL),(HL) is
+                    # opcode 0x76 (HALT) and was skipped above.
                     expected = WRAM_VALUE & 0xFF
             else:
                 expected = setup_ld_state(rom, source, value)
@@ -562,9 +601,7 @@ def add_inc_dec_tests(rom: Rom) -> None:
         for index, target in enumerate(REGISTER_CODES):
             opcode = start + index * 8
             value = 0xFF if index & 1 else 0x10
-            expected, flags = inc_dec_flags(
-                value, decrement=decrement, carry=True
-            )
+            expected, flags = inc_dec_flags(value, decrement=decrement, carry=True)
             rom.set_opcode(opcode)
             rom.set_af(0x55, 0x10)
             setup_cb_target(rom, target, value)
@@ -620,6 +657,11 @@ def add_16_bit_tests(rom: Rom) -> None:
         elif opcode == 0x39:
             rom.ld_rr(0x31, right)
         rom.ins(opcode)
+        if opcode == 0x39:
+            # ADD HL,SP leaves its result and flags intact, so restore a WRAM
+            # stack before PUSH AF captures those flags. Keeping SP=$0001 here
+            # would make the push write through cartridge and IE registers.
+            rom.ld_rr(0x31, 0xDFF0)
         rom.ins(0xF5)
         rom.ins(0xD1)
         result = (left + (left if opcode == 0x29 else right)) & 0xFFFF
@@ -759,8 +801,8 @@ def add_misc_cpu_tests(rom: Rom) -> None:
     # Signed SP operations at positive and negative boundaries.
     for opcode in (0xE8, 0xF8):
         for sp, offset, result, flags in (
-            (0x00FF, 1, 0x0100, 0x30),
-            (0x0000, 0xFF, 0xFFFF, 0x00),
+            (0xD0FF, 1, 0xD100, 0x30),
+            (0xD000, 0xFF, 0xCFFF, 0x00),
         ):
             rom.set_opcode(opcode)
             rom.ld_rr(0x31, sp)
@@ -952,14 +994,22 @@ def add_subsystem_tests(rom: Rom) -> None:
     rom.expect_memory(0xC456, 0xA5)
     rom.write_value(0xFF92, 0x77)
     rom.expect_memory(0xFF92, 0x77)
-    rom.write_value(0xFEA0, 0x99)
-    rom.expect_memory(0xFEA0, 0x00)
+    if not rom.cgb_flag:
+        # FEA0-FEFF reads as zero on monochrome hardware only while OAM is
+        # accessible; touching it during OAM scan can corrupt OAM. CGB behavior
+        # is revision-specific RAM or address-pattern data, so it is omitted.
+        disable_lcd_safely(rom)
+        rom.write_value(0xFEA0, 0x99)
+        rom.expect_memory(0xFEA0, 0x00)
+        rom.write_value(0xFF40, 0x91)
     rom.write_value(0xA100, 0x3C)
     rom.expect_memory(0xA100, 0x3C)
 
-    # ROM writes are trapped and cannot modify the instruction image.
+    # ROM writes cannot modify the instruction image. For the MBC5-backed CGB
+    # core, $0000-$1FFF is also the RAM-enable register, so retain the enabled
+    # state while proving that the cartridge ROM itself remains immutable.
     original = 0xC3
-    rom.write_value(0x0100, original ^ 0xFF)
+    rom.write_value(0x0100, 0x0A if rom.cartridge_type == 0x1A else original ^ 0xFF)
     rom.expect_memory(0x0100, original)
 
     # Joypad with no host input: both selected rows report all buttons released.
@@ -972,6 +1022,7 @@ def add_subsystem_tests(rom: Rom) -> None:
     # OAM DMA copies a complete page through the connected PPU.
     rom.set_case(0x31, 0)
     rom.announce("31 OAM DMA")
+    disable_lcd_safely(rom)
     rom.ld_rr(0x21, 0xC000)
     rom.ins(0x06, 0xA0)
     rom.ins(0x3E, 0x40)
@@ -981,9 +1032,25 @@ def add_subsystem_tests(rom: Rom) -> None:
     rom.ins(0x3C)
     rom.ins(0x05)
     rom.rel_branch(0x20, fill_loop)
-    rom.write_value(0xFF46, 0xC0)
+
+    # During OAM DMA, instruction fetches and ordinary memory accesses are
+    # bus-restricted. Install the conventional trampoline in HRAM, then let it
+    # start the transfer and wait the required 160 M-cycles before returning.
+    for index, value in enumerate((0xE0, 0x46, 0x3E, 40, 0x3D, 0x20, 0xFD, 0xC9)):
+        rom.write_value(OAM_DMA_ROUTINE + index, value)
+    rom.ld_a(0xC0)
+    rom.ins(0xCD, OAM_DMA_ROUTINE & 0xFF, OAM_DMA_ROUTINE >> 8)
     rom.expect_memory(0xFE00, 0x40)
     rom.expect_memory(0xFE9F, 0xDF)
+    rom.ld_rr(0x21, 0xFE00)
+    rom.ins(0x06, 0xA0)
+    rom.ins(0xAF)
+    oam_clear = rom.unique("oam_clear")
+    rom.label(oam_clear)
+    rom.ins(0x22)
+    rom.ins(0x05)
+    rom.rel_branch(0x20, oam_clear)
+    rom.write_value(0xFF40, 0x91)
 
     # DIV advances, and any write resets it.
     rom.set_case(0x32, 0)
@@ -1000,16 +1067,27 @@ def add_subsystem_tests(rom: Rom) -> None:
     rom.ins(0xFE, 0)
     rom.fail_if(0xCA)
 
-    # TIMA increments at TAC frequency 01 and reloads TMA on overflow.
+    # TIMA increments at the slow TAC clock and reloads TMA on overflow. Reset
+    # DIV immediately before enabling the timer, then poll with a finite budget
+    # instead of assuming a particular divider phase after a few NOPs.
+    rom.set_case(0x32, 1)
     rom.write_value(0xFF07, 0)
     rom.write_value(0xFF05, 0xFE)
     rom.write_value(0xFF06, 0xA7)
     rom.write_value(0xFF0F, 0)
-    rom.write_value(0xFF07, 0x05)
-    rom.ins(0x00)
-    rom.ins(0x00)
-    rom.ins(0x00)
-    rom.ins(0x00)
+    rom.write_value(0xFF04, 0)
+    rom.write_value(0xFF07, 0x04)
+    rom.ins(0x06, 0x80)
+    timer_wait = rom.unique("timer_wait")
+    timer_ready = rom.unique("timer_ready")
+    rom.label(timer_wait)
+    rom.read_a16(0xFF0F)
+    rom.ins(0xE6, 0x04)
+    rom.rel_branch(0x20, timer_ready)
+    rom.ins(0x05)
+    rom.rel_branch(0x20, timer_wait)
+    rom.jp("Fail")
+    rom.label(timer_ready)
     rom.write_value(0xFF07, 0)
     rom.expect_memory(0xFF05, 0xA7)
     rom.read_a16(0xFF0F)
@@ -1064,7 +1142,14 @@ def add_subsystem_tests(rom: Rom) -> None:
     rom.expect_a(0x77)
     rom.write_value(0xFF25, 0xFF)
 
+    # Wave RAM is directly readable while channel 3 is inactive. Once active,
+    # the selected byte or accessibility is model- and cycle-dependent.
+    rom.set_case(0x35, 1)
+    rom.write_value(0xFF30, 0xA5)
+    rom.expect_memory(0xFF30, 0xA5)
+
     # Trigger all four channels and verify their CPU-visible status bits.
+    rom.set_case(0x35, 2)
     for address, value in (
         (0xFF11, 0x80),
         (0xFF12, 0xF0),
@@ -1077,7 +1162,6 @@ def add_subsystem_tests(rom: Rom) -> None:
         (0xFF1A, 0x80),
         (0xFF1B, 0x00),
         (0xFF1C, 0x20),
-        (0xFF30, 0xA5),
         (0xFF1D, 0x00),
         (0xFF1E, 0x80),
         (0xFF20, 0x00),
@@ -1086,14 +1170,314 @@ def add_subsystem_tests(rom: Rom) -> None:
         (0xFF23, 0x80),
     ):
         rom.write_value(address, value)
-    rom.expect_memory(0xFF30, 0xA5)
+    rom.set_case(0x35, 3)
     rom.read_a16(0xFF26)
     rom.ins(0xE6, 0x0F)
     rom.expect_a(0x0F)
+    rom.set_case(0x35, 4)
     rom.write_value(0xFF26, 0)
     rom.read_a16(0xFF26)
     rom.ins(0xE6, 0x80)
     rom.expect_a(0)
+
+
+def expect_masked_register(
+    rom: Rom,
+    address: int,
+    mask: int,
+    expected: int,
+) -> None:
+    """Require selected bits from one memory-mapped register."""
+    rom.read_a16(address)
+    rom.ins(0xE6, mask)
+    rom.expect_a(expected)
+
+
+def disable_lcd_safely(rom: Rom) -> None:
+    """Wait for VBlank before disabling the LCD controller."""
+    wait_vblank = rom.unique("vblank")
+    rom.label(wait_vblank)
+    rom.read_a16(0xFF44)
+    rom.ins(0xFE, 144)
+    rom.rel_branch(0x38, wait_vblank)
+    rom.write_value(0xFF40, 0)
+
+
+def expect_pcm_level(rom: Rom, address: int, level: int) -> None:
+    """Bounded polling tolerates oscillator phase while checking exact nibbles."""
+    rom.ins(0x06, 0)  # 256 attempts, including both pulse duty states.
+    wait = rom.unique("pcm_wait")
+    ready = rom.unique("pcm_ready")
+    rom.label(wait)
+    rom.read_a16(address)
+    rom.ins(0xFE, level)
+    rom.rel_branch(0x28, ready)
+    rom.ins(0x05)
+    rom.rel_branch(0x20, wait)
+    rom.jp("Fail")
+    rom.label(ready)
+
+
+def check_fast_serial(rom: Rom, case: int) -> None:
+    """Require a transfer to remain busy initially and finish within 512 clocks.
+
+    CGB fast serial takes about 128 CPU clocks; normal serial takes about 4096.
+    The bounds allow divider phase differences but reject both an instant
+    transfer and an implementation that ignores SC's fast-clock bit.
+    """
+    rom.set_case(0x55, case)
+    rom.write_value(0xFF0F, 0)
+    rom.write_value(0xFF01, ord("C"))
+    rom.write_value(0xFF02, 0x83)
+    for _ in range(4):
+        rom.ins(0x00)
+    expect_masked_register(rom, 0xFF02, 0x80, 0x80)
+    rom.ins(0x06, 8)
+    wait = rom.unique("fast_serial_wait")
+    ready = rom.unique("fast_serial_ready")
+    rom.label(wait)
+    rom.ldh_read(0x02)
+    rom.ins(0xE6, 0x80)
+    rom.rel_branch(0x28, ready)
+    rom.ins(0x05)
+    rom.rel_branch(0x20, wait)
+    rom.jp("Fail")
+    rom.label(ready)
+    rom.expect_memory(0xFF01, 0xFF)
+    expect_masked_register(rom, 0xFF0F, 0x08, 0x08)
+    rom.write_value(0xFF0F, 0)
+
+
+def check_ppu_clock_ratio(rom: Rom, minimum: int, maximum: int) -> None:
+    """Measure CPU divider ticks across four PPU lines at the selected speed."""
+    start = rom.unique("ratio_start")
+    wait = rom.unique("ratio_wait")
+    rom.label(start)
+    rom.ldh_read(0x44)
+    rom.ins(0xFE, 145)
+    rom.rel_branch(0x20, start)
+    rom.write_value(0xFF04, 0)
+    rom.label(wait)
+    rom.ldh_read(0x44)
+    rom.ins(0xFE, 149)
+    rom.rel_branch(0x38, wait)
+    rom.ldh_read(0x04)
+    rom.ins(0xFE, minimum)
+    rom.fail_if(0xDA)  # Too few CPU clocks for these four scanlines.
+    rom.ins(0xFE, maximum + 1)
+    rom.fail_if(0xD2)
+
+
+def add_cgb_subsystem_tests(rom: Rom) -> None:
+    """Exercise hardware that is accessible only in native CGB mode."""
+    rom.set_case(0x50, 0)
+    rom.announce("50 CGB WRAM VRAM")
+    rom.expect_memory(0xC0F0, 0x11)
+    disable_lcd_safely(rom)
+
+    # C000-CFFF is fixed bank 0; D000-DFFF selects banks 1-7. Selecting bank
+    # zero aliases bank 1, and the selected bank participates in echo mapping.
+    rom.write_value(0xC123, 0xC0)
+    rom.write_value(0xFF70, 1)
+    expect_masked_register(rom, 0xFF70, 0x07, 1)
+    rom.write_value(0xD123, 0x11)
+    rom.expect_memory(0xF123, 0x11)
+    rom.write_value(0xFF70, 2)
+    rom.write_value(0xD123, 0x22)
+    rom.write_value(0xFF70, 7)
+    rom.write_value(0xD123, 0x77)
+    rom.write_value(0xFF70, 2)
+    rom.expect_memory(0xD123, 0x22)
+    rom.expect_memory(0xC123, 0xC0)
+    rom.write_value(0xFF70, 0)
+    rom.expect_memory(0xD123, 0x11)
+
+    # VRAM bank 1 contains both alternate tile data and tile-map attributes.
+    rom.write_value(0xFF4F, 0)
+    expect_masked_register(rom, 0xFF4F, 0x01, 0)
+    rom.write_value(0x9000, 0x10)
+    rom.write_value(0x9C00, 0x33)
+    rom.write_value(0xFF4F, 1)
+    expect_masked_register(rom, 0xFF4F, 0x01, 1)
+    rom.write_value(0x9000, 0x21)
+    rom.write_value(0x9C00, 0xAB)
+    rom.expect_memory(0x9000, 0x21)
+    rom.expect_memory(0x9C00, 0xAB)
+    rom.write_value(0xFF4F, 0)
+    rom.expect_memory(0x9000, 0x10)
+    rom.expect_memory(0x9C00, 0x33)
+    rom.write_value(0xFF40, 0x91)
+
+    # Palette 7 is outside the progress console's palette 0. Auto-increment
+    # advances on writes but not reads, and BG/OBJ palette RAM is independent.
+    rom.set_case(0x51, 0)
+    rom.announce("51 CGB PALETTES")
+    disable_lcd_safely(rom)
+    rom.write_value(0xFF68, 0xB8)
+    rom.write_value(0xFF69, 0x1F)
+    rom.write_value(0xFF69, 0x00)
+    expect_masked_register(rom, 0xFF68, 0xBF, 0xBA)
+    rom.write_value(0xFF68, 0x38)
+    rom.expect_memory(0xFF69, 0x1F)
+    rom.expect_memory(0xFF69, 0x1F)
+    rom.write_value(0xFF68, 0x39)
+    rom.expect_memory(0xFF69, 0x00)
+    rom.write_value(0xFF6A, 0xB8)
+    rom.write_value(0xFF6B, 0xE0)
+    rom.write_value(0xFF6B, 0x03)
+    expect_masked_register(rom, 0xFF6A, 0xBF, 0xBA)
+    rom.write_value(0xFF6A, 0x38)
+    rom.expect_memory(0xFF6B, 0xE0)
+    rom.write_value(0xFF6A, 0x39)
+    rom.expect_memory(0xFF6B, 0x03)
+    rom.write_value(0xFF40, 0x91)
+
+    # General-purpose VRAM DMA copies one 16-byte block atomically while the
+    # LCD is disabled and reports FF in HDMA5 when complete.
+    rom.set_case(0x52, 0)
+    rom.announce("52 CGB GDMA")
+    disable_lcd_safely(rom)
+    rom.ld_rr(0x21, 0xC100)
+    rom.ins(0x06, 0x10)
+    rom.ld_a(0x60)
+    gdma_fill = rom.unique("gdma_fill")
+    rom.label(gdma_fill)
+    rom.ins(0x22)
+    rom.ins(0x3C)
+    rom.ins(0x05)
+    rom.rel_branch(0x20, gdma_fill)
+    rom.write_value(0xFF4F, 1)
+    rom.write_value(0xFF51, 0xC1)
+    rom.write_value(0xFF52, 0x00)
+    rom.write_value(0xFF53, 0x01)
+    rom.write_value(0xFF54, 0x00)
+    rom.write_value(0xFF55, 0x00)
+    rom.expect_memory(0xFF55, 0xFF)
+    rom.expect_memory(0x8100, 0x60)
+    rom.expect_memory(0x810F, 0x6F)
+    rom.write_value(0xFF4F, 0)
+    rom.write_value(0xFF40, 0x91)
+
+    # HBlank DMA leaves the CPU runnable between its two 16-byte blocks. Start
+    # immediately after enabling LCD to avoid initiating during HBlank.
+    rom.set_case(0x53, 0)
+    rom.announce("53 CGB HDMA")
+    disable_lcd_safely(rom)
+    rom.ld_rr(0x21, 0xC120)
+    rom.ins(0x06, 0x20)
+    rom.ld_a(0x80)
+    hdma_fill = rom.unique("hdma_fill")
+    rom.label(hdma_fill)
+    rom.ins(0x22)
+    rom.ins(0x3C)
+    rom.ins(0x05)
+    rom.rel_branch(0x20, hdma_fill)
+    rom.write_value(0xFF4F, 1)
+    rom.write_value(0xFF51, 0xC1)
+    rom.write_value(0xFF52, 0x20)
+    rom.write_value(0xFF53, 0x02)
+    rom.write_value(0xFF54, 0x00)
+    rom.write_value(0xFF40, 0x91)
+    rom.write_value(0xFF55, 0x81)
+    hdma_wait = rom.unique("hdma_wait")
+    rom.label(hdma_wait)
+    rom.read_a16(0xFF55)
+    rom.ins(0xFE, 0xFF)
+    rom.rel_branch(0x20, hdma_wait)
+    disable_lcd_safely(rom)
+    rom.expect_memory(0x8200, 0x80)
+    rom.expect_memory(0x821F, 0x9F)
+    rom.write_value(0xFF4F, 0)
+    rom.write_value(0xFF40, 0x91)
+
+    # KEY1 arms STOP to toggle CPU speed. Switch to double speed and back so
+    # the diagnostic leaves the machine in its original timing mode.
+    rom.set_case(0x54, 0)
+    rom.announce("54 CGB SPEED")
+    expect_masked_register(rom, 0xFF4D, 0x81, 0)
+    rom.write_value(0xFFFF, 0)
+    rom.write_value(0xFF00, 0x30)
+    rom.write_value(0xFF4D, 1)
+    expect_masked_register(rom, 0xFF4D, 0x81, 1)
+    rom.ins(0x10, 0x00)
+    expect_masked_register(rom, 0xFF4D, 0x81, 0x80)
+    rom.set_case(0x54, 1)
+    check_ppu_clock_ratio(rom, 12, 16)
+    # The serial divider follows CPU clocks, unlike the PPU and APU.
+    check_fast_serial(rom, 1)
+    rom.set_case(0x54, 2)
+    rom.write_value(0xFF4D, 1)
+    rom.ins(0x10, 0x00)
+    expect_masked_register(rom, 0xFF4D, 0x81, 0)
+    check_ppu_clock_ratio(rom, 6, 8)
+
+    # CGB serial bit 1 selects the fast internal clock.
+    rom.set_case(0x55, 0)
+    rom.announce("55 CGB FAST SERIAL")
+    check_fast_serial(rom, 0)
+
+    # Exercise the writable infrared controls and the CGB object-priority
+    # selector without asserting the environment-dependent receiver bit.
+    rom.set_case(0x56, 0)
+    rom.announce("56 CGB IR PRIORITY")
+    rom.write_value(0xFF56, 0xC1)
+    expect_masked_register(rom, 0xFF56, 0xC1, 0xC1)
+    rom.write_value(0xFF56, 0)
+    expect_masked_register(rom, 0xFF56, 0xC1, 0)
+    rom.write_value(0xFF6C, 1)
+    expect_masked_register(rom, 0xFF6C, 1, 1)
+    rom.write_value(0xFF6C, 0)
+    expect_masked_register(rom, 0xFF6C, 1, 0)
+
+    # The shared APU group leaves master power off, so both CGB-only digital
+    # channel-output registers must report silence deterministically.
+    rom.set_case(0x57, 0)
+    rom.announce("57 CGB PCM OUTPUT")
+    rom.expect_memory(0xFF76, 0)
+    rom.expect_memory(0xFF77, 0)
+    # Activate one channel at a time using distinct amplitudes, verifying both
+    # nibble placement and DAC-off silence. NR51 remains muted: PCM is before
+    # the host audio mixer and must remain observable without speaker routing.
+    rom.write_value(0xFF26, 0x80)
+    for case, address, expected, writes, dac in (
+        (
+            1,
+            0xFF76,
+            0x03,
+            ((0xFF11, 0x80), (0xFF12, 0x30), (0xFF13, 0xF0), (0xFF14, 0x87)),
+            0xFF12,
+        ),
+        (
+            2,
+            0xFF76,
+            0x50,
+            ((0xFF16, 0x80), (0xFF17, 0x50), (0xFF18, 0xF0), (0xFF19, 0x87)),
+            0xFF17,
+        ),
+        (
+            3,
+            0xFF77,
+            0x07,
+            ((0xFF1A, 0x80), (0xFF1C, 0x20), (0xFF1D, 0xF0), (0xFF1E, 0x87)),
+            0xFF1A,
+        ),
+        (4, 0xFF77, 0x90, ((0xFF21, 0x90), (0xFF22, 0), (0xFF23, 0x80)), 0xFF21),
+    ):
+        rom.set_case(0x57, case)
+        if case == 3:
+            for wave_address in range(0xFF30, 0xFF40):
+                rom.write_value(wave_address, 0x77)
+        for register, value in writes:
+            rom.write_value(register, value)
+        expect_pcm_level(rom, address, expected)
+        rom.write_value(dac, 0)
+        rom.expect_memory(address, 0)
+    rom.set_case(0x57, 5)
+    rom.write_value(0xFF26, 0)
+    rom.expect_memory(0xFF76, 0)
+    rom.expect_memory(0xFF77, 0)
+    rom.write_value(0xFF4F, 0)
+    rom.write_value(0xFF70, 1)
 
 
 def emit_result_text(rom: Rom, text: bytes) -> None:
@@ -1105,6 +1489,9 @@ def add_result_handlers(rom: Rom) -> None:
     rom.label("Pass")
     emit_result_text(rom, b"Passed")
     rom.write_value(0xA004, 0)
+    if rom.cgb_flag:
+        rom.write_value(0xFF4F, 0)
+    rom.write_value(0xFF40, 0x91)
     rom.announce("PASS")
     pass_loop = rom.unique("pass")
     rom.label(pass_loop)
@@ -1114,6 +1501,9 @@ def add_result_handlers(rom: Rom) -> None:
 
     rom.label("Fail")
     rom.ins(0xF3)
+    if rom.cgb_flag:
+        rom.write_value(0xFF4F, 0)
+    rom.write_value(0xFF40, 0x91)
     rom.announce("ERROR")
     for value in b"AT ":
         rom.ld_a(value)
@@ -1156,6 +1546,13 @@ def add_display_and_serial_routines(rom: Rom) -> None:
     rom.label("InitDisplay")
     rom.ins(0xAF)
     rom.ldh_write(0x40)
+    if rom.cgb_flag:
+        # Select VRAM bank 0 and install a high-contrast CGB palette. The font
+        # uses color index 1 for set pixels and color index 0 for its field.
+        rom.write_value(0xFF4F, 0)
+        rom.write_value(0xFF68, 0x80)
+        for value in (0xFF, 0x7F, 0x00, 0x00, 0x10, 0x42, 0x00, 0x00):
+            rom.write_value(0xFF69, value)
     rom.ld_hl_label("FontData")
     rom.ld_rr(0x11, 0x8000)
     rom.ld_rr(0x01, len(font_data()))
@@ -1168,6 +1565,20 @@ def add_display_and_serial_routines(rom: Rom) -> None:
     rom.ins(0x78)
     rom.ins(0xB1)
     rom.rel_branch(0x20, copy_loop)
+    if rom.cgb_flag:
+        # Clear the attribute bytes behind the progress row so it always uses
+        # VRAM bank 0 and background palette 0.
+        rom.write_value(0xFF4F, 1)
+        rom.ld_rr(0x11, 0x9800)
+        rom.ins(0x06, 20)
+        rom.ins(0xAF)
+        attribute_loop = rom.unique("attribute_clear")
+        rom.label(attribute_loop)
+        rom.ins(0x12)
+        rom.ins(0x13)
+        rom.ins(0x05)
+        rom.rel_branch(0x20, attribute_loop)
+        rom.write_value(0xFF4F, 0)
     rom.ld_a(0xE4)
     rom.ldh_write(0x47)
     rom.ld_a(0x91)
@@ -1179,6 +1590,10 @@ def add_display_and_serial_routines(rom: Rom) -> None:
     rom.ld_hl_label("ProtocolPrefix")
     rom.call("SendStringSerial")
     rom.ins(0xE1)
+    if rom.cgb_flag:
+        rom.write_value(0xFF4F, 0)
+    rom.ins(0xE5)
+    disable_lcd_safely(rom)
     rom.ld_rr(0x11, 0x9800)
     rom.ins(0x06, 20)
     rom.ins(0xAF)
@@ -1195,14 +1610,14 @@ def add_display_and_serial_routines(rom: Rom) -> None:
     rom.ins(0x2A)
     rom.ins(0xA7)
     rom.rel_branch(0x28, print_done)
-    rom.ins(0x47)
     rom.ins(0xD6, 32)
     rom.ins(0x12)
     rom.ins(0x13)
-    rom.ins(0x78)
-    rom.call("SendChar")
     rom.rel_branch(0x18, print_loop)
     rom.label(print_done)
+    rom.write_value(0xFF40, 0x91)
+    rom.ins(0xE1)
+    rom.call("SendStringSerial")
     rom.ld_a(10)
     rom.call("SendChar")
     rom.ins(0xC9)
@@ -1467,18 +1882,33 @@ def build_controller_roms() -> dict[str, bytes]:
     }
 
 
-def build_core_rom() -> tuple[bytes, dict]:
-    rom = Rom("OTR-DIAGNOSTIC")
+def build_core_rom(*, cgb: bool = False) -> tuple[bytes, CoreManifest]:
+    """Build the shared diagnostic core for DMG or native CGB mode."""
+    rom = Rom(
+        "OTR-CGB-DIAG" if cgb else "OTR-DIAGNOSTIC",
+        cartridge_type=0x1A,
+        cgb_flag=0xC0 if cgb else 0x00,
+    )
     add_vectors(rom)
     rom.label("Main")
+    if cgb:
+        # The CGB boot ROM hands off with A=$11. Preserve it before any setup
+        # code changes A so the native-mode suite can reject a wrong target.
+        rom.write_a16(0xC0F0)
     rom.ins(0xF3)
     rom.ld_rr(0x31, 0xDFF0)
     rom.call("InitDisplay")
+    # Both cores use MBC5+RAM instead of the historically unused and
+    # hardware-ambiguous mapperless ROM+RAM type. Enable their 8 KiB SRAM
+    # before publishing the OTR/1 mailbox.
+    rom.write_value(0x0000, 0x0A)
+    # Commit RUNNING before the magic, so instruction-by-instruction observers
+    # cannot mistake uninitialized cartridge RAM for a terminal result.
+    rom.write_value(0xA004, 0x7E)
     rom.write_value(0xA000, ord("O"))
     rom.write_value(0xA001, ord("T"))
     rom.write_value(0xA002, ord("R"))
     rom.write_value(0xA003, ord("1"))
-    rom.write_value(0xA004, 0x7E)
     rom.write_value(0xA005, 0)
     rom.write_value(0xA006, 0)
     emit_result_text(rom, b"Running")
@@ -1491,12 +1921,15 @@ def build_core_rom() -> tuple[bytes, dict]:
     add_alu_tests(rom)
     add_cb_tests(rom)
     add_subsystem_tests(rom)
+    if cgb:
+        add_cgb_subsystem_tests(rom)
     rom.jp("Pass")
     add_result_handlers(rom)
     add_display_and_serial_routines(rom)
     add_rom_data(rom)
 
-    missing_base = LEGAL_BASE_OPCODES - rom.base_coverage - {0x10}
+    probe_only = set() if cgb else {0x10}
+    missing_base = LEGAL_BASE_OPCODES - rom.base_coverage - probe_only
     if missing_base:
         values = " ".join(f"{value:02X}" for value in sorted(missing_base))
         raise ValueError(f"core ROM is missing legal base opcodes: {values}")
@@ -1506,17 +1939,46 @@ def build_core_rom() -> tuple[bytes, dict]:
         raise ValueError(f"core ROM is missing CB opcodes: {values}")
 
     image = rom.finish()
-    manifest = {
-        "schema_version": 1,
-        "rom": "otr.gb",
+    subsystems = [
+        "cpu",
+        "interrupts",
+        "timer",
+        "memory bus",
+        "wram/echo",
+        "hram",
+        "cartridge ram",
+        "joypad",
+        "serial",
+        "oam dma",
+        "ppu registers",
+        "apu registers",
+    ]
+    if cgb:
+        subsystems.extend(
+            (
+                "cgb boot mode",
+                "cgb wram banking",
+                "cgb vram banking",
+                "cgb bg map attributes",
+                "cgb palette ram",
+                "cgb general-purpose vram dma",
+                "cgb hblank vram dma",
+                "cgb double-speed mode",
+                "cgb fast serial",
+                "cgb infrared port",
+                "cgb object priority",
+                "cgb pcm outputs",
+            )
+        )
+    manifest: CoreManifest = {
+        "schema_version": 2,
+        "rom": "otr-cgb.gb" if cgb else "otr.gb",
         "sha256": hashlib.sha256(image).hexdigest(),
         "size": len(image),
         "code_end": rom.pc,
         "protocol": "OTR/1",
         "base_opcodes": [f"{value:02X}" for value in sorted(LEGAL_BASE_OPCODES)],
-        "core_base_opcodes": [
-            f"{value:02X}" for value in sorted(rom.base_coverage)
-        ],
+        "core_base_opcodes": [f"{value:02X}" for value in sorted(rom.base_coverage)],
         "cb_opcodes": [f"CB {value:02X}" for value in sorted(rom.cb_coverage)],
         "dedicated_probes": {
             "10": "STOP probe",
@@ -1525,20 +1987,7 @@ def build_core_rom() -> tuple[bytes, dict]:
                 for value in sorted(ILLEGAL_BASE_OPCODES)
             },
         },
-        "subsystems": [
-            "cpu",
-            "interrupts",
-            "timer",
-            "memory bus",
-            "wram/echo",
-            "hram",
-            "cartridge ram",
-            "joypad",
-            "serial",
-            "oam dma",
-            "ppu registers",
-            "apu registers",
-        ],
+        "subsystems": subsystems,
     }
     return image, manifest
 
@@ -1553,15 +2002,32 @@ def build_probe_rom(opcode: int) -> bytes:
     return rom.finish()
 
 
-def bundle() -> tuple[bytes, dict, dict[str, bytes], dict[str, bytes]]:
+def bundle() -> tuple[
+    bytes,
+    bytes,
+    BundleManifest,
+    dict[str, bytes],
+    dict[str, bytes],
+]:
     image, manifest = build_core_rom()
+    cgb_image, cgb_manifest = build_core_rom(cgb=True)
     controllers = build_controller_roms()
     probes = {
         f"{opcode:02x}.gb": build_probe_rom(opcode)
         for opcode in (0x10, *sorted(ILLEGAL_BASE_OPCODES))
     }
-    manifest = {
+    bundle_manifest: BundleManifest = {
         **manifest,
+        "targets": ["dmg", "cgb"],
+        "cgb_rom": {
+            "rom": cgb_manifest["rom"],
+            "size": cgb_manifest["size"],
+            "sha256": cgb_manifest["sha256"],
+            "code_end": cgb_manifest["code_end"],
+            "base_opcodes": cgb_manifest["core_base_opcodes"],
+            "cb_opcodes": cgb_manifest["cb_opcodes"],
+            "subsystems": cgb_manifest["subsystems"],
+        },
         "controller_roms": {
             name: {
                 "size": len(controller),
@@ -1570,17 +2036,17 @@ def bundle() -> tuple[bytes, dict, dict[str, bytes], dict[str, bytes]]:
             for name, controller in controllers.items()
         },
         "probe_roms": {
-            name: hashlib.sha256(probe).hexdigest()
-            for name, probe in probes.items()
+            name: hashlib.sha256(probe).hexdigest() for name, probe in probes.items()
         },
     }
-    return image, manifest, controllers, probes
+    return image, cgb_image, bundle_manifest, controllers, probes
 
 
-def write_outputs(output: Path) -> dict:
+def write_outputs(output: Path) -> BundleManifest:
     output.mkdir(parents=True, exist_ok=True)
-    image, manifest, controllers, probes = bundle()
+    image, cgb_image, manifest, controllers, probes = bundle()
     (output / "otr.gb").write_bytes(image)
+    (output / "otr-cgb.gb").write_bytes(cgb_image)
     (output / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
@@ -1595,7 +2061,7 @@ def write_outputs(output: Path) -> dict:
     return manifest
 
 
-def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output",
@@ -1606,18 +2072,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.check:
-        expected_image, expected_manifest, controllers, probes = bundle()
+        expected_image, expected_cgb_image, expected_manifest, controllers, probes = (
+            bundle()
+        )
         image_path = args.output / "otr.gb"
+        cgb_image_path = args.output / "otr-cgb.gb"
         manifest_path = args.output / "manifest.json"
-        if not image_path.is_file() or not manifest_path.is_file():
+        if (
+            not image_path.is_file()
+            or not cgb_image_path.is_file()
+            or not manifest_path.is_file()
+        ):
             print("generated first-party ROM artifacts are missing")
             return 1
         actual_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if image_path.read_bytes() != expected_image:
             print(f"{image_path} is stale; regenerate it")
+            return 1
+        if cgb_image_path.read_bytes() != expected_cgb_image:
+            print(f"{cgb_image_path} is stale; regenerate it")
             return 1
         if actual_manifest != expected_manifest:
             print(f"{manifest_path} is stale; regenerate it")
@@ -1634,8 +2110,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     manifest = write_outputs(args.output)
     print(
-        f"wrote {manifest['rom']} ({manifest['size']} bytes, "
-        f"sha256 {manifest['sha256']})"
+        f"wrote {manifest['rom']} and {manifest['cgb_rom']['rom']} "
+        f"(DMG sha256 {manifest['sha256']}, "
+        f"CGB sha256 {manifest['cgb_rom']['sha256']})"
     )
     return 0
 

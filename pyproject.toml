@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "obscuretone-test-rom"
 version = "0.1.0"
-description = "Obscuretone's self-checking DMG opcode and subsystem diagnostic ROM"
+description = "Obscuretone's self-checking DMG and CGB diagnostic ROM suite"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -13,7 +13,12 @@ license-files = ["LICENSE"]
 authors = [{ name = "Evan D'Entremont" }]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9"]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=8.4,<9",
+    "pytest-cov>=7,<8",
+    "ruff>=0.14,<1",
+]
 
 [project.urls]
 Repository = "https://github.com/Obscuretone/obscuretone-test-rom"
@@ -21,11 +26,42 @@ Issues = "https://github.com/Obscuretone/obscuretone-test-rom/issues"
 
 [project.scripts]
 otr-build = "generate:main"
+otr-verify = "verify:main"
 
 [tool.setuptools]
-py-modules = ["generate"]
+py-modules = ["generate", "verify"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = """
+    -ra
+    --strict-config
+    --strict-markers
+    --cov=generate
+    --cov=verify
+    --cov-branch
+    --cov-report=term-missing
+    --cov-fail-under=100
+"""
 pythonpath = ["."]
+
+[tool.coverage.run]
+branch = true
+source = ["generate", "verify"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+files = ["generate.py", "verify.py", "tests"]
+python_version = "3.10"
+strict = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]

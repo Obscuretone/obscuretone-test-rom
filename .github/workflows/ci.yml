@@ -8,41 +8,150 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: otr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUTF8: "1"
+
 jobs:
-  build:
+  quality:
+    name: Static quality gates
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install quality tools
+        run: python -m pip install ".[dev]"
+
+      - name: Check formatting
+        run: python -m ruff format --check .
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Type-check
+        run: python -m mypy
+
+  build:
+    name: Test and build on Python ${{ matrix.python-version }}
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
-      - name: Install test dependencies
-        run: python -m pip install -e ".[dev]"
+      - name: Install project and test dependencies
+        run: python -m pip install ".[dev]"
 
-      - name: Test generator
+      - name: Test with full branch coverage
         run: pytest
 
-      - name: Build .gb ROMs
-        run: python generate.py --output dist
+      - name: Build .gb ROMs through the installed entry point
+        run: otr-build --output dist
 
-      - name: Verify reproducibility
-        run: python generate.py --output dist --check
+      - name: Verify artifacts independently
+        run: otr-verify dist
 
-      - name: Upload .gb ROMs
-        if: matrix.python-version == '3.13'
-        uses: actions/upload-artifact@v7
+      - name: Verify generator reproducibility
+        run: otr-build --output dist --check
+
+      - name: Upload cross-version comparison build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: otr-build-python-${{ matrix.python-version }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload public .gb artifact
+        if: matrix.python-version == '3.14'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: otr-gb-roms
           path: |
             dist/otr.gb
+            dist/otr-cgb.gb
             dist/controllers/*.gb
             dist/probes/*.gb
             dist/manifest.json
           if-no-files-found: error
           retention-days: 30
+
+  reference:
+    name: Execute DMG and CGB ROMs in SameBoy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: LIJI32/SameBoy
+          ref: 208ba4afabffab9edde416f2dbb8ae459e34adb8 # v1.0.3
+          path: .reference/SameBoy
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: otr-build-python-3.14
+          path: dist
+
+      - name: Build independent reference runner
+        run: |
+          make -C .reference/SameBoy -j2 build/lib/libsameboy.a \
+            CC=gcc CONF=release DISABLE_DEBUGGER=1 DISABLE_REWIND=1 DISABLE_CHEATS=1
+          gcc -std=gnu11 -I.reference/SameBoy tools/reference.c \
+            .reference/SameBoy/build/lib/libsameboy.a -lm -o .reference/otr-reference
+
+      - name: Require both core ROMs to pass
+        run: |
+          .reference/otr-reference dmg dist/otr.gb
+          .reference/otr-reference cgb dist/otr-cgb.gb
+
+  reproducibility:
+    name: Compare every Python build byte-for-byte
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download comparison builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: otr-build-python-*
+          path: builds
+
+      - name: Require identical artifacts
+        shell: bash
+        run: |
+          mapfile -t otr_build_dirs < <(find builds -mindepth 1 -maxdepth 1 -type d | sort)
+          test "${#otr_build_dirs[@]}" -eq 5
+          otr_reference_dir="${otr_build_dirs[0]}"
+          for otr_candidate_dir in "${otr_build_dirs[@]:1}"; do
+            diff --recursive --brief "$otr_reference_dir" "$otr_candidate_dir"
+          done
